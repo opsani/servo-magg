@@ -1,0 +1,593 @@
+#!/usr/bin/env python3
+
+from measure import Measure, ST_FAILED
+
+import copy
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+import yaml
+
+DESC = "Measure driver agrregator for Opsani Optune"
+VERSION = "1.0.0"
+PROGRESS_INTERVAL = 30
+# this will actually be determined by sub-drivers and force_cancel
+HAS_CANCEL = True
+
+DRIVERS_DIR="measure.d"
+CFG_FILE="config.yaml"
+DRIVER_NAME="magg"
+
+
+DFLT_GRACE_PERIOD = 0
+
+# Control keys that affect total driver execution time. These will be used to
+# calculate a timeout if 'grace_period' is specified in the config
+CONTROL_TIME_KEYS = ["warmup", "duration", "delay", "past"]
+
+# If a driver fails and we try to stop all other drivers, how long to wait for
+# drivers to exit after sending SIGUSR1 before we SIGKILL them
+DFTL_DRIVER_CLEANUP_GRACE_T = 300
+
+
+class Aggregator(Measure):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.cfg = self._get_driver_cfg()
+
+        # Get list of drivers
+        self.drivers = self._list_drivers()
+
+        if not len(self.drivers):
+            raise Exception(
+                "Measure aggregator: at least one sub-driver is required")
+
+        self._procs = []
+        self._term_in_prog = False
+
+        # get drivers info (needed for supports_cancel)
+        self.drivers_info = self._get_driver_info()
+
+        # supports_cancel is True if all drivers support it or if
+        # "force_cancel" is set in our config
+        if self.cfg.get("force_cancel", False):
+            self.supports_cancel = True
+        else:
+            all_cancel = [v["has_cancel"] for v in self.drivers_info.values()]
+            self.supports_cancel = False if False in all_cancel else True
+
+
+    # overwrites super so that include a custom response to '--info' and include
+    # per driver info
+    def run(self):
+        # Handle --info
+        if self.args.info:
+            out = {
+                "has_cancel": self.supports_cancel,
+                "version": self.version,
+                "drivers": self.drivers_info,
+            }
+            print(json.dumps(out), flush=True)
+            sys.exit(0)
+
+        # else, run super
+        super().run()
+
+
+    # overwrites super
+    def handle_cancel(self, signal, frame):
+        err = 'Exiting due to signal: {}'.format(signal)
+        self.debug(err)
+
+        # terminate running processes
+        if not self._term_in_prog:
+            self._stop_running_procs()
+
+        self.print_measure_error(err, ST_FAILED)
+
+        sys.exit(3)
+
+
+    # overwrites super
+    def describe(self):
+        # run all drivers with --describe, handle errors
+        try:
+            metrics = self._get_metric_per_driver()
+        except Exception as e:
+            new_msg = "Failed to get driver description: {}".format(str(e))
+            # Works on python3 only!
+            raise type(e)(new_msg).with_traceback(sys.exc_info()[2])
+
+        combined = {m: data for d in metrics.values()
+                    for m, data in d["metrics"].items()}
+
+        return combined
+
+    # overwrites super
+    def measure(self):
+
+        # Determine which metrics are handled by each driver
+        try:
+            metrics = self._get_metric_per_driver()
+        except Exception as e:
+            new_msg = "Failed to get driver description (as part of " + \
+                "measurement): {}"
+            new_msg = new_msg.format(str(e))
+            # Works on python3 only!
+            raise type(e)(new_msg).with_traceback(sys.exc_info()[2])
+
+        input_metrics = self.input_data.get('metrics', {})
+        input_control = self.input_data.get('control', {})
+        input_userdata = input_control.get('userdata', {})
+
+        # If metrics are part of the input, split by driver
+        m_per_d = {}
+        if input_metrics:
+            m_per_d = { d: m["metrics"].keys() for d, m in metrics.items() }
+
+        # Prepare input per driver
+        drivers_input={}
+        drivers_input_data={}
+
+        for d in self.drivers:
+            d_input = {}
+
+            # Start with top level control section
+            d_input["control"] = copy.deepcopy(input_control)
+            # Remove top level userdata
+            d_input["control"].pop("userdata", None)
+
+            # Update control with any values from
+            # control/userdata/<driver>/control
+            d_merge_control = input_userdata.get(d, {}).get("control", {})
+            d_input["control"].update(d_merge_control)
+
+            # Split metrics per driver
+            if d in m_per_d:
+                d_m = {m: data for m, data in input_metrics.items()
+                       if m in m_per_d[d]}
+
+                if d_m:
+                    d_input["metrics"] = d_m
+
+            drivers_input[d] = json.dumps(d_input).encode()
+            drivers_input_data[d] = d_input
+
+
+        #  Run all drivers with timeout
+        term_on_err = self.supports_cancel
+        timeout = int(self.cfg.get("grace_period", DFLT_GRACE_PERIOD))
+
+        # If timeout is configured
+        if timeout > 0:
+            max_t = 0
+            for d, data in drivers_input_data.items():
+                d_ctl = data.get("control", {})
+                d_time = sum([d_ctl.get(i, 0) for i in CONTROL_TIME_KEYS])
+                max_t = max(max_t, d_time)
+
+            timeout = max_t + timeout
+
+        try:
+            driver_out = self._run_drivers(
+                [self.app_id], stdin=drivers_input, term_on_err=term_on_err,
+                timeout = timeout)
+        except Exception as e:
+            raise # TODO
+
+        # Check if all drivers returned OK status:
+        fail_drivers = [d for d, d_data in driver_out.items()
+                        if d_data.get("status", None) != "ok"]
+
+        if fail_drivers:
+            msg = "Error occured running measurement drivers. Failed " + \
+                "drivers: {}. Drivers output: {}"
+            msg = msg.format(fail_drivers, driver_out)
+            raise Exception(msg)
+
+        # Merge output
+        merged_metrics = {m: data for d, d_data in driver_out.items()
+                          for m, data in d_data["metrics"].items()}
+
+        merged_ann = {m: data for d, d_data in driver_out.items()
+                      for m, data in d_data["annotations"].items()}
+
+        return merged_metrics, merged_ann
+
+
+    def _get_metric_per_driver(self):
+        # run all drivers with --describe
+        driver_out = self._run_drivers(
+            ["--describe", self.app_id], term_on_err = False)
+
+        # merge result
+        m_per_d = {k: list(v["metrics"].keys()) for k, v in driver_out.items()}
+        all_metrics = [m for vals in m_per_d.values() for m in vals]
+
+        # Check for metrics that are reported by more then one driver - this is
+        # not allowed and will trigger an error
+        uniq_metrics = set(all_metrics)
+        if len(uniq_metrics) != len(all_metrics):
+            d_per_m = {}
+            errors = []
+            for m in uniq_metrics:
+                for d, d_metrics in m_per_d.items():
+                    if m in d_metrics:
+                        if m not in d_per_m:
+                            d_per_m[m] = []
+
+                        d_per_m[m].append(d)
+
+            for m, drivers in d_per_m.items():
+                if len(drivers) < 2:
+                    continue  # it is only an error if > 1 driver reported it
+                msg = "metric: '{}' reported by drivers: {}.".format(
+                    m, drivers)
+                errors.append(msg)
+
+            msg = "Error: duplicate metrics found: {}. Full driver output: {}."
+
+            msg = msg.format(" ".join(errors), driver_out)
+            raise Exception(msg)
+
+        return driver_out
+
+
+    def _get_driver_cfg(self):
+        '''
+        load the user-defined configuration
+        '''
+
+        try:
+            f = open(CFG_FILE)
+            d = yaml.load(f)
+        except IOError as e:
+            return {} # no config, totatly fine
+        except yaml.error.YAMLError as e:
+            # We have invalid config, not cool
+            raise Exception("syntax error in {}: {}".format(CFG_FILE, str(e)))
+
+        return d.get(DRIVER_NAME, {}) # can return empty dict
+
+    def _list_drivers(self):
+        """
+        returns a list of sub-driver names
+        """
+        drivers = []
+        for f in os.listdir(DRIVERS_DIR):
+            p = os.path.join(DRIVERS_DIR, f)
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                drivers.append(f)
+
+        return drivers
+
+    def _get_driver_info(self):
+
+        try:
+            driver_out = self._run_drivers(["--info"], term_on_err = False)
+
+            # Check version and has_cancel for each driver
+            errors = []
+            for name, data in driver_out.items():
+                if "has_cancel" not in data:
+                    msg = "Driver {} did not return 'has_cancel'".format(name)
+                    errors.append(msg)
+                if "version" not in data:
+                    msg = "Driver {} did not return 'version'".format(name)
+                    errors.append(msg)
+
+            # Check for errors
+            if len(errors):
+                raise Exception(" ".join(errors))
+        except Exception as e:
+            new_msg = "Failed to get driver info: {}".format(str(e))
+            # Works on python3 only!
+            raise type(e)(new_msg).with_traceback(sys.exc_info()[2])
+
+        return driver_out
+
+    def _run_parallel_commands(self, commands, term_on_err=False, timeout=0):
+        """
+        Runs all commands simultaniously and returns the result.
+        Input:
+        * commands: list of commands to run. Each command is dictionary with
+        keys 'cmd' (a string or a list) and 'stdin'.
+        * term_on_err: if set to True, an exit of one command with non-zero
+        status code will terminate the rest and will raise an exception
+        Output:
+        * A list (in the same order as the input list) of dicts, with keys:
+        command (as provided), returncode, stdout (string), stderr (string).
+        For example:
+        [
+            {
+                "command": ["/bin/ls", "-la"],
+                "retcode": 0,
+                "stdout": "...",
+                "stderr": "...",
+
+            },
+            {
+                ...
+            }
+        ]
+        """
+        output = []
+        progress = []
+
+        self._procs = []
+        rlist = []
+        wlist = []
+        xlist = []
+
+        for c in commands:
+            p = subprocess.Popen(
+                c["cmd"],
+                bufsize=0,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE)
+            self._procs.append(p)
+
+            rlist.append(p.stdout)
+            rlist.append(p.stderr)
+
+            wlist.append(p.stdin)
+
+            xlist.append(p.stdin)
+            xlist.append(p.stdout)
+            xlist.append(p.stderr)
+
+            # Initialize return output
+            output.append({
+                "retcode": None,
+                "stdout": None,
+                "stderr": [],
+            })
+
+            # Initialize progress
+            progress.append(0)
+
+        start_t = time.time()
+        while True:
+            # Run select with a timeout of 10s so we can keep track of time
+            # passed (i.e. to monitor for a timeout)
+            r, w, e = select.select(rlist, wlist, xlist, 10)
+
+            for fp in r:
+                # find which process owns this
+                p = [p for p in self._procs if p.stdout ==
+                     fp or p.stderr == fp][0]
+                p_idx = self._procs.index(p)
+
+                proc_done = False
+
+                if p.stderr == fp: # this is stderr
+                    l = fp.read(4096)
+                    if not l and p.poll() is not None:
+                        proc_done = True
+                    else: # we read data
+                        output[p_idx]["stderr"].append(l)
+
+                else: # this is stdout
+
+                    l = fp.readline()
+                    if not l and p.poll() is not None:
+                        proc_done = True
+                    else:
+
+                        # there will always be a complete line, driver writes
+                        # one line at a time
+                        stdout_line = l.strip().decode("UTF-8")
+                        stdout = {}
+                        try:
+                            stdout = json.loads(stdout_line)
+                        except Exception:
+                            msg = "Failed to parse output from driver {}, " + \
+                                "output was : {}"
+                            self.debug(msg.format(
+                                self.drivers[p_idx], stdout_line))
+                            p.terminate()
+                            proc_done = True
+
+                        if "progress" in stdout:
+                            progress[p_idx] = int(stdout["progress"])
+                            self.progress = min(progress)
+
+                            if "message" in stdout and stdout["message"]:
+                                driver = self.drivers[p_idx]
+                                msg = "Driver {}: {}".format(
+                                    driver, stdout["message"])
+                                self.print_progress(msg)
+                        else:
+                            output[p_idx]["stdout"] = stdout_line
+
+                if proc_done:
+                    fp.close()
+                    # This process is done, remove it from lists
+                    try:
+                        rlist.pop(rlist.index(fp))
+                    except ValueError:
+                        pass  # we may have removed it already
+
+                    try:
+                        xlist.pop(xlist.index(fp))
+                    except ValueError:
+                        pass  # we may have removed it already
+
+                    output[p_idx]["retcode"] = p.returncode
+
+                    if p.returncode !=0 and term_on_err and not self._term_in_prog:
+
+                        msg = "magg: process {} failed, stopping all other processes"
+                        self.debug(msg.format(p.args))
+
+                        self._stop_running_procs()
+
+
+            for fp in w:
+                # Find which process owns that pipe
+                p = [p for p in self._procs if p.stdin == fp][0]
+                p_idx = self._procs.index(p)
+                stdin = commands[p_idx]["stdin"]
+
+                fp_done = False
+                if not stdin:
+                    fp_done = True
+                else:
+                    # write with select.PIPE_BUF bytes or less should not block
+                    l = min(getattr(select, 'PIPE_BUF', 512), len(stdin))
+                    if not l:
+                        fp_done = True
+                    else:
+                        p.stdin.write(stdin[:l])
+                        commands[p_idx]["stdin"] = stdin[l:]
+
+                if fp_done:
+                    p.stdin.close()
+                    wlist.pop(wlist.index(fp))
+                    xlist.pop(xlist.index(fp))
+
+            passed_t = int(time.time() - start_t)
+            if timeout > 0 and passed_t > timeout and not self._term_in_prog:
+                msg = "magg: timeout waiting for drivers to finish, " + \
+                    "waited {} seconds, allowed grace_period is {} seconds"
+                self.debug(msg.format(passed_t, timeout))
+
+                self._stop_running_procs()
+
+            # Nothing more to read
+            if not rlist and not wlist and not xlist:
+                break
+
+
+        # Join stderr as a string
+        for o in output:
+            o["stderr"] = b"\n".join(o["stderr"]).decode("UTF-8")
+
+        return output
+
+
+    def _run_drivers(self, params=[], stdin={}, term_on_err=False, timeout = 0):
+        """
+        Runs all drivers and returns a dict where keys are the driver names and
+        values are the parse stdout of each driver. If any driver retruns an
+        error, raise an exception.
+        """
+
+        # driver commands to run in parallel
+        commands = []
+        for d in self.drivers:
+            driver_exec = os.path.join(DRIVERS_DIR, d)
+            cmd = [driver_exec]
+            cmd.extend(params)
+
+            commands.append({
+                "cmd": cmd,
+                "stdin": stdin.get(d, None),
+            })
+
+        result = self._run_parallel_commands(
+            commands,
+            term_on_err=term_on_err,
+            timeout = timeout)
+
+        driver_output = {}
+
+        # Agrregate errors
+        errors = []
+        failed_drivers = []
+        ok_drivers = []
+
+        # Check that all drivers succeeded and pasre stdout
+        for idx, data in enumerate(result):
+            name = self.drivers[idx]
+            if data["retcode"] != 0:
+                msg = "Driver {} exitted with status code {}. Stdout: {}. " + \
+                    "Stderr: {}."
+                msg = msg.format(
+                    name, data["retcode"], data["stdout"], data["stderr"])
+
+                errors.append(msg)
+                failed_drivers.append(name)
+            else:
+                try:
+                    driver_output[name] = json.loads(data["stdout"])
+                    ok_drivers.append(name)
+                except Exception as e:
+                    msg = "Driver {}: failed to parse output: {}. Error: {}."
+                    msg = msg.format(name, data["stdout"], str(e))
+
+                    errors.append(msg)
+                    failed_drivers.append(name)
+
+        # Check for errors
+        if len(errors):
+            msg = "Error occured while running drivers with parameters {}." + \
+                " Failed drivers: {} (details below). Successfull drivers: " + \
+                "{} (output below). Detailed errors: {}. Successfull " + \
+                "drivers output: {}"
+
+            msg = msg.format(
+                params,
+                failed_drivers,
+                ok_drivers,
+                " ".join(errors),
+                driver_output)
+            raise Exception(msg)
+
+        # Sanity check: Make sure return value has data for each driver
+        drivers_w_output = list(driver_output.keys())
+        if sorted(self.drivers) != sorted(drivers_w_output):
+            msg = "Failed running drivers: not all drivers produced ouput. " + \
+                "Drivers: {}, drivers with output: {}. Driver's output: {}"
+
+            raise Exception(msg.format(
+                str(self.drivers), str(drivers_w_output), driver_output))
+
+        return driver_output
+
+    def _stop_running_procs(self):
+
+        self._term_in_prog = True
+
+        procs_running = [p for p in self._procs if p.poll() is None]
+        self.debug("magg: stopping all running processes: ", len(procs_running))
+
+        if not procs_running:
+            return
+
+        for p in procs_running:
+            self.debug("magg: sending SIGUSR1 to proc", p.args)
+            p.send_signal(signal.SIGUSR1)
+
+        needs_kill = True
+        timeout = self.cfg.get("cleanup_grace_period",
+            DFTL_DRIVER_CLEANUP_GRACE_T)
+
+        msg = "magg: waiting up to {} seconds before sending SIGKILL to " + \
+            "all running processes"
+        self.debug(msg.format(timeout))
+        for i in range(timeout):
+            time.sleep(1)
+            procs_running = len([p for p in self._procs if p.poll() is None])
+
+            if not procs_running:
+                needs_kill = False
+                break
+
+        if needs_kill:
+            for p in self._procs:
+                if p.poll() is None:
+                    self.debug("magg: force killing proc", p.args)
+                    p.kill()
+
+
+if __name__ == '__main__':
+    driver = Aggregator(VERSION, DESC, HAS_CANCEL, PROGRESS_INTERVAL)
+    driver.run()
