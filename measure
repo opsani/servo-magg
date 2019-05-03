@@ -318,6 +318,7 @@ class Aggregator(Measure):
         ]
         """
         output = []
+        err_msg = None
         progress = []
 
         self._procs = []
@@ -455,9 +456,12 @@ class Aggregator(Measure):
 
             passed_t = int(time.time() - start_t)
             if timeout > 0 and passed_t > timeout and not self._term_in_prog:
-                msg = "magg: timeout waiting for drivers to finish, " + \
-                    "waited {} seconds, allowed grace_period is {} seconds"
-                self.debug(msg.format(passed_t, timeout))
+                msg = "Timeout waiting for drivers to finish, " + \
+                    "waited {} seconds, allowed grace_period is {} seconds."
+                msg = msg.format(passed_t, timeout)
+                self.debug("magg:", msg)
+
+                err_msg = msg
 
                 self._stop_running_procs()
 
@@ -470,7 +474,7 @@ class Aggregator(Measure):
         for o in output:
             o["stderr"] = b"\n".join(o["stderr"]).decode("UTF-8")
 
-        return output
+        return output, err_msg
 
 
     def _run_drivers(self, params=[], stdin={}, term_on_err=False, timeout = 0):
@@ -492,7 +496,7 @@ class Aggregator(Measure):
                 "stdin": stdin.get(d, None),
             })
 
-        result = self._run_parallel_commands(
+        result, err_msg = self._run_parallel_commands(
             commands,
             term_on_err=term_on_err,
             timeout = timeout)
@@ -528,13 +532,14 @@ class Aggregator(Measure):
 
         # Check for errors
         if len(errors):
-            msg = "Error occured while running drivers with parameters {}." + \
-                " Failed drivers: {} (details below). Successfull drivers: " + \
+            msg = "Error occured while running drivers with parameters {}. " + \
+                "{}Failed drivers: {} (details below). Successfull drivers: " + \
                 "{} (output below). Detailed errors: {}. Successfull " + \
                 "drivers output: {}"
 
             msg = msg.format(
                 params,
+                err_msg + " " if err_msg else "",
                 failed_drivers,
                 ok_drivers,
                 " ".join(errors),
