@@ -9,6 +9,51 @@ The aggregator behaves like a normal `measure` driver and will be recognized as 
 
 Progress is reported as the minimum progress of all sub-drivers.
 
+When measuring, the aggregator splits the incoming input payload between the sub-drivers in the following way:
+ * it runs all sub-drivers with --describe in order to determine which metric from the input (if provided) should go to which driver. The input for each sub-driver includes only the metrics that the driver returns on describe.
+ * the control section passed to each driver is the result of merging the control section that the aggregator received (except `userdata`, which is removed) and `control/userdata/<driver_name>/control` (if present). This allows control parameters to be overwritten per driver. For example, if the aggregator receives an input like:
+```
+{
+    "control": {
+    	"duration": 300,
+        "past": 20,
+        "userdata": {
+            "driver1": {
+                "control": {
+                    "past": 30,
+                    "userdata": {
+                        "foo" : "bar"
+                    }
+                }
+            },
+            "driver2": {
+                ...
+            }
+        }
+    },
+    "metrics" : {
+        ...
+    }
+}
+```
+
+It would run driver1 with an input of:
+
+```
+{
+    "control": {
+        "duration": 300,
+        "past": 30,         # overridden from userdata
+        "userdata": {
+            "foo" : "bar"
+        }
+    },
+    "metrics" : {
+        ...                 # only metrics that driver1 returned on describe
+    }
+}
+```
+
 
 ## Setup
 
@@ -19,7 +64,7 @@ To use the aggregator:
 - the configuration file should be placed in the root directory where the aggregator is (not in `measure.d`). This root directory should be the current directory when the aggregator is run (this is also where one would place the `servo` agent, just as one would when configuring it with a single measure driver).
 
 The resulting directory structure should look like this:
-
+```
 /servo/             # this will be the current directory when ‘measure’ is ran
       /config.yaml  # configuration for all drivers
       /measure      # the aggregator executable
@@ -32,6 +77,7 @@ The resulting directory structure should look like this:
             /driver1  # executable
             /driver2  # executable
             /datafile # not executable
+```
 
 NOTE:the only files in `measure.d` that have the executable flag should be one or more `measure` drivers. If the driver requires any supporting executables of its own, they should be installed elsewhere (OK to place them in a sub-directory of `measure.d`)
 
