@@ -122,7 +122,7 @@ class Aggregator(Measure):
             # Works on python3 only!
             raise type(e)(new_msg).with_traceback(sys.exc_info()[2])
 
-        input_metrics = self.input_data.get('metrics', {})
+        input_metrics = self.input_data.get('metrics', [])
         input_control = self.input_data.get('control', {})
         input_userdata = input_control.get('userdata', {})
 
@@ -150,15 +150,13 @@ class Aggregator(Measure):
 
             # Split metrics per driver
             if d in m_per_d:
-                d_m = {m: data for m, data in input_metrics.items()
-                       if m in m_per_d[d]}
+                d_m = [m for m in input_metrics if m in m_per_d[d]]
 
                 if d_m:
                     d_input["metrics"] = d_m
 
             drivers_input[d] = json.dumps(d_input).encode()
             drivers_input_data[d] = d_input
-
 
         #  Run all drivers with timeout
         term_on_err = self.supports_cancel
