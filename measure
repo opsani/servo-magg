@@ -365,19 +365,24 @@ class Aggregator(Measure):
                 p_idx = self._procs.index(p)
 
                 proc_done = False
+                eos = False
 
                 if p.stderr == fp: # this is stderr
                     l = fp.read(4096)
-                    if not l and p.poll() is not None:
-                        proc_done = True
+                    if not l:
+                        eos = True
+                        if p.poll() is not None:
+                            proc_done = True
                     else: # we read data
                         output[p_idx]["stderr"].append(l)
 
                 else: # this is stdout
 
                     l = fp.readline()
-                    if not l and p.poll() is not None:
-                        proc_done = True
+                    if not l:
+                        eos = True
+                        if p.poll() is not None:
+                            proc_done = True
                     else:
 
                         # there will always be a complete line, driver writes
@@ -406,7 +411,7 @@ class Aggregator(Measure):
                         else:
                             output[p_idx]["stdout"] = stdout_line
 
-                if proc_done:
+                if eos:
                     fp.close()
                     # This process is done, remove it from lists
                     try:
@@ -419,6 +424,7 @@ class Aggregator(Measure):
                     except ValueError:
                         pass  # we may have removed it already
 
+                if proc_done:
                     output[p_idx]["retcode"] = p.returncode
 
                     if p.returncode !=0 and term_on_err and not self._term_in_prog:
@@ -467,6 +473,26 @@ class Aggregator(Measure):
             if not rlist and not wlist and not xlist:
                 break
 
+        # mop up any processes that closed their output but haven't exited yet
+        for p_idx in range(len(output)):
+            p = self._procs[p_idx]
+            if output[p_idx]["retcode"] is not None:
+                continue # retcode already collected
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                try:
+                    p.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass # ignore it, process got kill(), OS will clean it eventually (returncode will be None, so we'll print err message below)
+
+            output[p_idx]["retcode"] = p.returncode
+            if p.returncode !=0: #NOTE returncode=None will also be an error here!
+                        msg = "magg: process {} failed (detected after outputs closed)"
+                        self.debug(msg.format(p.args))
+
+                        # self._stop_running_procs()
 
         # Join stderr as a string
         for o in output:
@@ -542,6 +568,7 @@ class Aggregator(Measure):
                 ok_drivers,
                 " ".join(errors),
                 driver_output)
+            sys.stderr.flush()
             raise Exception(msg)
 
         # Sanity check: Make sure return value has data for each driver
@@ -568,6 +595,7 @@ class Aggregator(Measure):
         for p in procs_running:
             self.debug("magg: sending SIGUSR1 to proc", p.args)
             p.send_signal(signal.SIGUSR1)
+            # LK: TODO: should send SIGTERM if target didn't report support for cancel!
 
         needs_kill = True
         timeout = self.cfg.get("cleanup_grace_period",
