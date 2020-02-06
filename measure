@@ -244,7 +244,7 @@ class Aggregator(Measure):
 
         try:
             f = open(CFG_FILE)
-            d = yaml.load(f)
+            d = yaml.safe_load(f)
         except IOError as e:
             return {} # no config, totatly fine
         except yaml.error.YAMLError as e:
@@ -501,12 +501,16 @@ class Aggregator(Measure):
         return output, err_msg
 
 
-    def _run_drivers(self, params=[], stdin={}, term_on_err=False, timeout = 0):
+    def _run_drivers(self, params=None, stdin=None, term_on_err=False, timeout = 0):
         """
         Runs all drivers and returns a dict where keys are the driver names and
         values are the parse stdout of each driver. If any driver retruns an
         error, raise an exception.
         """
+        if params is None:
+            params = []
+        if stdin is None:
+            stdin = {}
 
         # driver commands to run in parallel
         commands = []
