@@ -536,7 +536,7 @@ class Aggregator(Measure):
         for idx, data in enumerate(result):
             name = self.drivers[idx]
             if data["retcode"] != 0:
-                msg = "Driver {} exitted with status code {}. Stdout: {}. " + \
+                msg = "Driver {} exited with status code {}. Stdout: {}. " + \
                     "Stderr: {}."
                 msg = msg.format(
                     name, data["retcode"], data["stdout"], data["stderr"])
@@ -557,8 +557,8 @@ class Aggregator(Measure):
         # Check for errors
         if len(errors):
             msg = "Error occured while running drivers with parameters {}. " + \
-                "{}Failed drivers: {} (details below). Successfull drivers: " + \
-                "{} (output below). Detailed errors: {}. Successfull " + \
+                "{}Failed drivers: {} (details below). Successful drivers: " + \
+                "{} (output below). Detailed errors: {}. Successful " + \
                 "drivers output: {}"
 
             msg = msg.format(
