@@ -244,7 +244,7 @@ class Aggregator(Measure):
 
         try:
             f = open(CFG_FILE)
-            d = yaml.load(f)
+            d = yaml.safe_load(f)
         except IOError as e:
             return {} # no config, totatly fine
         except yaml.error.YAMLError as e:
