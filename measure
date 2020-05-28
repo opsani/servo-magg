@@ -73,7 +73,7 @@ class Aggregator(Measure):
                 "version": self.version,
                 "drivers": self.drivers_info,
             }
-            print(json.dumps(out), flush=True)
+            print('{}\n'.format(json.dumps(out)), end='', flush=True)
             sys.exit(0)
 
         # else, run super
